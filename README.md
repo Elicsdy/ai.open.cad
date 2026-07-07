@@ -62,6 +62,8 @@ Long-running CAD generation, repair, and refinement use async jobs. Job snapshot
 
 Multiple visitors are separated with an anonymous browser-scoped client ID sent as `X-AI-OpenCAD-Client-ID`. Projects and async jobs are scoped by that ID. This is isolation for shared usage, not an authentication or permissions system.
 
+Image-to-CAD is available from the frontend and `POST /ai/open/cad/generate-cad-from-image-async`. Upload PNG, JPEG, or WebP images up to 10MB. Dimensioned drawings are prompted to use visible dimensions; object photos are prompted to generate a robust approximate assembled model and list assumptions. This feature requires a vision-capable model/provider that supports Responses API image input.
+
 ## CAD Mode
 
 The current AI generation mode is `cascade-js`.
@@ -102,6 +104,7 @@ Remove `-Snapshot` for a real tagged release in a valid git checkout.
 - `POST /ai/open/cad/repair-cad`
 - `POST /ai/open/cad/refine-cad`
 - `POST /ai/open/cad/generate-cad-async`
+- `POST /ai/open/cad/generate-cad-from-image-async`
 - `POST /ai/open/cad/repair-cad-async`
 - `POST /ai/open/cad/refine-cad-async`
 - `GET /ai/open/cad/jobs/:id`

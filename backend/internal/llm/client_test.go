@@ -115,6 +115,56 @@ func TestGenerateCADCallsOpenAIResponsesAPI(t *testing.T) {
 	}
 }
 
+func TestGenerateCADFromImageCallsResponsesAPIWithImage(t *testing.T) {
+	var seen responsesRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(responsesResponse{
+			OutputText: `{"code":"Box(10,20,30,true);","explanation":"from image","warnings":["assumed thickness"]}`,
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(config.LLMConfig{
+		BaseURL:         server.URL,
+		APIKey:          "test-key",
+		Model:           "test-model",
+		Timeout:         time.Second,
+		ReasoningEffort: "high",
+	})
+	resp, err := client.GenerateCADFromImage(context.Background(), GenerateFromImageRequest{
+		Prompt:   "make this bracket",
+		Language: "cascade-js",
+		Image:    []byte{0x89, 0x50, 0x4e, 0x47},
+		MimeType: "image/png",
+		FileName: "bracket.png",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code != "Box(10,20,30,true);" {
+		t.Fatalf("unexpected code: %s", resp.Code)
+	}
+	if len(seen.Input) != 2 {
+		t.Fatalf("unexpected input length: %+v", seen.Input)
+	}
+	user := seen.Input[1]
+	if user.Role != "user" || len(user.Content) != 2 {
+		t.Fatalf("unexpected user content: %+v", user)
+	}
+	if user.Content[1].Type != "input_image" {
+		t.Fatalf("expected input_image, got %+v", user.Content[1])
+	}
+	if !strings.HasPrefix(user.Content[1].ImageURL, "data:image/png;base64,") {
+		t.Fatalf("expected image data URL, got %s", user.Content[1].ImageURL)
+	}
+}
+
 func TestRefineCADCallsOpenAIResponsesAPI(t *testing.T) {
 	var seen responsesRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

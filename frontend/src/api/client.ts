@@ -17,17 +17,34 @@ export interface AsyncRequestOptions {
 }
 
 async function requestJSON<T>(endpoint: string, init?: RequestInit): Promise<T> {
+  return request<T>(endpoint, init, { json: true })
+}
+
+async function requestMultipart<T>(endpoint: string, formData: FormData): Promise<T> {
+  return request<T>(endpoint, {
+    method: 'POST',
+    body: formData,
+  })
+}
+
+async function request<T>(
+  endpoint: string,
+  init?: RequestInit,
+  options: { json?: boolean } = {},
+): Promise<T> {
   const url = apiPath(endpoint)
   const clientId = getClientId()
+  const headers = new Headers(init?.headers)
+  headers.set('X-AI-OpenCAD-Client-ID', clientId)
+  if (options.json) {
+    headers.set('Content-Type', 'application/json')
+  }
+
   let response: Response
   try {
     response = await fetch(url, {
       ...init,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-AI-OpenCAD-Client-ID': clientId,
-        ...init?.headers,
-      },
+      headers,
     })
   } catch (error) {
     throw new Error(`Request failed before reaching the backend: ${toMessage(error)}`)
@@ -86,6 +103,18 @@ export function refineCAD(
   )
 }
 
+export function generateCADFromImage(
+  file: File,
+  prompt: string,
+  options?: AsyncRequestOptions,
+): Promise<GenerateCADResponse> {
+  const form = new FormData()
+  form.append('image', file)
+  form.append('prompt', prompt)
+  form.append('language', 'cascade-js')
+  return requestAsyncJob<GenerateCADResponse>('generate-cad-from-image-async', undefined, options, form)
+}
+
 export function listProjects(): Promise<Project[]> {
   return requestJSON('projects')
 }
@@ -112,8 +141,11 @@ async function requestAsyncJob<T>(
   endpoint: string,
   init?: RequestInit,
   options?: AsyncRequestOptions,
+  formData?: FormData,
 ): Promise<T> {
-  const job = await requestJSON<AsyncJob<T>>(endpoint, init)
+  const job = formData
+    ? await requestMultipart<AsyncJob<T>>(endpoint, formData)
+    : await requestJSON<AsyncJob<T>>(endpoint, init)
   const seenEvents = new Set<string>()
   emitNewEvents(job.events, seenEvents, options)
   const closeStream = openJobEventStream(job.id, seenEvents, options)

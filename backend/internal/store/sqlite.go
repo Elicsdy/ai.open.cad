@@ -59,8 +59,6 @@ CREATE TABLE IF NOT EXISTS projects (
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_projects_updated_at ON projects(updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_projects_owner_updated_at ON projects(owner_id, updated_at DESC);
 CREATE TABLE IF NOT EXISTS settings (
 	key TEXT PRIMARY KEY,
 	value TEXT NOT NULL,
@@ -70,11 +68,50 @@ CREATE TABLE IF NOT EXISTS settings (
 	if err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'default'`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	if err := s.ensureProjectOwnerColumn(ctx); err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_projects_owner_updated_at ON projects(owner_id, updated_at DESC)`)
+	_, err = s.db.ExecContext(ctx, `
+CREATE INDEX IF NOT EXISTS idx_projects_updated_at ON projects(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_projects_owner_updated_at ON projects(owner_id, updated_at DESC);
+`)
 	return err
+}
+
+func (s *SQLite) ensureProjectOwnerColumn(ctx context.Context) error {
+	hasOwnerID, err := s.projectColumnExists(ctx, "owner_id")
+	if err != nil {
+		return err
+	}
+	if hasOwnerID {
+		return nil
+	}
+	_, err = s.db.ExecContext(ctx, `ALTER TABLE projects ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'default'`)
+	return err
+}
+
+func (s *SQLite) projectColumnExists(ctx context.Context, column string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(projects)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var columnType string
+		var notNull int
+		var defaultValue sql.NullString
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if strings.EqualFold(name, column) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *SQLite) ListProjects(ctx context.Context) ([]Project, error) {

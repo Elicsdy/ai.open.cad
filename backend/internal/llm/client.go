@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,6 +57,15 @@ type GenerateResponse struct {
 	Warnings    []string `json:"warnings"`
 }
 
+type GenerateFromImageRequest struct {
+	Prompt    string
+	Language  string
+	Image     []byte
+	MimeType  string
+	FileName  string
+	ProjectID string
+}
+
 type RepairRequest struct {
 	Prompt string   `json:"prompt"`
 	Code   string   `json:"code"`
@@ -94,13 +104,15 @@ type responsesRequest struct {
 }
 
 type responseInput struct {
-	Role    string             `json:"role"`
-	Content []responseTextPart `json:"content"`
+	Role    string                `json:"role"`
+	Content []responseContentPart `json:"content"`
 }
 
-type responseTextPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+type responseContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+	Detail   string `json:"detail,omitempty"`
 }
 
 type responsesReasoning struct {
@@ -193,6 +205,15 @@ func NewClient(cfg config.LLMConfig) *Client {
 	}
 }
 
+func (c *Client) doHTTPRequest(req *http.Request, timeout time.Duration) (*http.Response, error) {
+	if timeout <= 0 || timeout == c.httpClient.Timeout {
+		return c.httpClient.Do(req)
+	}
+	client := *c.httpClient
+	client.Timeout = timeout
+	return client.Do(req)
+}
+
 func (c *Client) GenerateCAD(ctx context.Context, req GenerateRequest) (GenerateResponse, error) {
 	req.Prompt = strings.TrimSpace(req.Prompt)
 	if req.Prompt == "" {
@@ -224,6 +245,58 @@ func (c *Client) GenerateCAD(ctx context.Context, req GenerateRequest) (Generate
 		return GenerateResponse{}, errors.New("model returned empty code")
 	}
 	reportProgress(ctx, "Generated Cascade Studio JS successfully.")
+	return out, nil
+}
+
+func (c *Client) GenerateCADFromImage(ctx context.Context, req GenerateFromImageRequest) (GenerateResponse, error) {
+	req.Prompt = strings.TrimSpace(req.Prompt)
+	if req.Prompt == "" {
+		req.Prompt = "Generate a practical CAD model from this image."
+	}
+	req.Language = "cascade-js"
+	if len(req.Image) == 0 {
+		return GenerateResponse{}, errors.New("image is required")
+	}
+	mimeType, ok := normalizeImageMimeType(req.MimeType)
+	if !ok {
+		return GenerateResponse{}, fmt.Errorf("unsupported image MIME type: %s", req.MimeType)
+	}
+
+	cfg := c.effectiveConfig()
+	if cfg.APIKey == "" {
+		reportProgress(ctx, "LLM API key is empty; using built-in demo CAD response without image analysis.")
+		out := demoGenerate(GenerateRequest{Prompt: req.Prompt, Language: "cascade-js"})
+		out.Warnings = append([]string{"Image analysis requires llm.apiKey; demo mode cannot inspect the uploaded image."}, out.Warnings...)
+		return out, nil
+	}
+
+	reportProgress(ctx, "Preparing image-to-CAD vision request.")
+	input := responseInputMessages([]modelMessage{
+		{Role: "system", Content: generateImageSystemPrompt()},
+	})
+	input = append(input, responseInput{
+		Role: "user",
+		Content: []responseContentPart{
+			{Type: "input_text", Text: imageCADUserPrompt(req)},
+			{Type: "input_image", ImageURL: imageDataURL(mimeType, req.Image), Detail: "high"},
+		},
+	})
+
+	content, err := c.callResponsesInput(ctx, cfg, "generate_cad_from_image", generateCADJSONSchema(), input)
+	if err != nil {
+		return GenerateResponse{}, err
+	}
+
+	reportProgress(ctx, "Parsing image-to-CAD model response.")
+	var out GenerateResponse
+	if err := decodeJSONContent(content, &out); err != nil {
+		return GenerateResponse{}, err
+	}
+	out.Code = cleanupCode(out.Code)
+	if strings.TrimSpace(out.Code) == "" {
+		return GenerateResponse{}, errors.New("model returned empty code")
+	}
+	reportProgress(ctx, "Generated Cascade Studio JS from image successfully.")
 	return out, nil
 }
 
@@ -323,11 +396,27 @@ func (c *Client) effectiveConfig() config.LLMConfig {
 }
 
 func (c *Client) callModel(ctx context.Context, cfg config.LLMConfig, schemaName string, schema map[string]any, messages []modelMessage) (string, error) {
+	content, responsesErr := c.callResponsesInput(ctx, cfg, schemaName, schema, responseInputMessages(messages))
+	if responsesErr == nil {
+		return content, nil
+	}
+
+	reportProgress(ctx, "Trying Chat Completions compatibility fallback.")
+	content, err := c.callChatCompletions(ctx, cfg, messages)
+	if err == nil {
+		reportProgress(ctx, "Model response received from Chat Completions fallback.")
+		return content, nil
+	}
+	reportProgress(ctx, "Chat Completions fallback failed: "+shortError(err)+".")
+	return "", modelRequestError([]string{responsesErr.Error(), "chat_completions: " + err.Error()})
+}
+
+func (c *Client) callResponsesInput(ctx context.Context, cfg config.LLMConfig, schemaName string, schema map[string]any, input []responseInput) (string, error) {
 	attempts := responseFallbackAttempts(cfg)
 	var failures []string
 	for _, attempt := range attempts {
 		reportProgress(ctx, "Calling model: "+describeResponseAttempt(attempt.cfg)+".")
-		content, err := c.doResponses(ctx, attempt.cfg, schemaName, schema, messages)
+		content, err := c.doResponses(ctx, attempt.cfg, schemaName, schema, input)
 		if err == nil {
 			reportProgress(ctx, "Model response received from Responses API.")
 			return content, nil
@@ -338,20 +427,11 @@ func (c *Client) callModel(ctx context.Context, cfg config.LLMConfig, schemaName
 			return "", err
 		}
 	}
-
-	reportProgress(ctx, "Trying Chat Completions compatibility fallback.")
-	content, err := c.callChatCompletions(ctx, cfg, messages)
-	if err == nil {
-		reportProgress(ctx, "Model response received from Chat Completions fallback.")
-		return content, nil
-	}
-	failures = append(failures, "chat_completions: "+err.Error())
-	reportProgress(ctx, "Chat Completions fallback failed: "+shortError(err)+".")
 	return "", modelRequestError(failures)
 }
 
-func (c *Client) doResponses(ctx context.Context, cfg config.LLMConfig, schemaName string, schema map[string]any, messages []modelMessage) (string, error) {
-	content, err := c.doResponsesRequest(ctx, cfg, schemaName, schema, messages, true)
+func (c *Client) doResponses(ctx context.Context, cfg config.LLMConfig, schemaName string, schema map[string]any, input []responseInput) (string, error) {
+	content, err := c.doResponsesRequest(ctx, cfg, schemaName, schema, input, true)
 	if err == nil {
 		return content, nil
 	}
@@ -359,14 +439,14 @@ func (c *Client) doResponses(ctx context.Context, cfg config.LLMConfig, schemaNa
 		return "", err
 	}
 	reportProgress(ctx, "Provider does not support Responses streaming; retrying without stream.")
-	return c.doResponsesRequest(ctx, cfg, schemaName, schema, messages, false)
+	return c.doResponsesRequest(ctx, cfg, schemaName, schema, input, false)
 }
 
-func (c *Client) doResponsesRequest(ctx context.Context, cfg config.LLMConfig, schemaName string, schema map[string]any, messages []modelMessage, stream bool) (string, error) {
+func (c *Client) doResponsesRequest(ctx context.Context, cfg config.LLMConfig, schemaName string, schema map[string]any, input []responseInput, stream bool) (string, error) {
 	endpoint := responsesEndpoint(cfg.BaseURL)
 	reqBody := responsesRequest{
 		Model:  cfg.Model,
-		Input:  responseInputMessages(messages),
+		Input:  input,
 		Stream: stream,
 		Text: &responsesText{
 			Format: &responsesTextFormat{
@@ -395,7 +475,7 @@ func (c *Client) doResponsesRequest(ctx context.Context, cfg config.LLMConfig, s
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doHTTPRequest(req, cfg.Timeout)
 	if err != nil {
 		return "", err
 	}
@@ -439,12 +519,40 @@ func responseInputMessages(messages []modelMessage) []responseInput {
 	for _, message := range messages {
 		input = append(input, responseInput{
 			Role: message.Role,
-			Content: []responseTextPart{
+			Content: []responseContentPart{
 				{Type: "input_text", Text: message.Content},
 			},
 		})
 	}
 	return input
+}
+
+func normalizeImageMimeType(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "image/png":
+		return "image/png", true
+	case "image/jpeg", "image/jpg":
+		return "image/jpeg", true
+	case "image/webp":
+		return "image/webp", true
+	default:
+		return "", false
+	}
+}
+
+func imageDataURL(mimeType string, image []byte) string {
+	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(image)
+}
+
+func imageCADUserPrompt(req GenerateFromImageRequest) string {
+	var parts []string
+	parts = append(parts, "User request: "+req.Prompt)
+	if strings.TrimSpace(req.FileName) != "" {
+		parts = append(parts, "Uploaded file name: "+strings.TrimSpace(req.FileName))
+	}
+	parts = append(parts, "Task: inspect the image and generate one assembled Cascade Studio JavaScript CAD model.")
+	parts = append(parts, "If it is a dimensioned drawing, extract the shown dimensions and use them exactly. If it is a photo or object image, infer a robust CAD approximation and list important assumptions.")
+	return strings.Join(parts, "\n")
 }
 
 func extractResponsesText(out responsesResponse) string {
@@ -546,7 +654,7 @@ func (c *Client) doChatCompletions(ctx context.Context, cfg config.LLMConfig, me
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doHTTPRequest(req, cfg.Timeout)
 	if err != nil {
 		return "", err
 	}
@@ -883,6 +991,47 @@ Rules:
 - Use millimeters.
 - Generate an assembled model: all parts must be positioned, aligned, and joined as a finished assembly, not scattered loose pieces.
 - Prefer more detailed, manufacturable geometry when it remains robust: ribs, fillets/chamfers, mounting holes, bosses, slots, relief cuts, and realistic clearances.
+- The final statement must create or return renderable geometry by calling Box, Sphere, Cylinder, Cone, Union, Difference, or Intersection.
+- Make one final solid or a small set of solids remain renderable in the scene.
+- For booleans, capture shapes in variables and call Difference(main, [cutters]) or Union([parts]).
+- Difference and Union arguments must be valid shapes created earlier in the code; cutters must overlap the main body when subtracting.
+- Keep geometry simple and robust for browser OpenCascade.`
+}
+
+func generateImageSystemPrompt() string {
+	return `You generate CAD code for AI OpenCAD from an uploaded image.
+Return JSON only: {"code":"Cascade Studio JavaScript code","explanation":"short explanation","warnings":["optional warnings"]}.
+
+Generate Cascade Studio JavaScript, not OpenSCAD.
+Carefully classify the image before modeling:
+- If it is a technical drawing, blueprint, dimensioned sketch, CAD screenshot, or annotated diagram, extract all visible dimensions, hole positions, radii, angles, thicknesses, and symmetry constraints. Use those dimensions directly in millimeters when units are visible; if units are absent, state the assumed unit scale.
+- If it is a real object photo, product photo, or concept image, infer the main solids, proportions, assembly relationships, ergonomic/mechanical features, and likely manufacturable dimensions. Use realistic approximate measurements and list important assumptions in warnings.
+- If the image contains text labels or dimension callouts, use them as higher priority than visual proportions.
+- If details are hidden or ambiguous, create a robust simplified CAD approximation instead of inventing fragile decorative details.
+
+The code runs directly in Cascade Studio's browser worker with these functions in scope:
+- Box(x, y, z, centered)
+- Cylinder(radius, height, centered)
+- Cone(radius1, radius2, height)
+- Sphere(radius)
+- Translate([x, y, z], shape)
+- Rotate([axisX, axisY, axisZ], degrees, shape)
+- Scale([x, y, z], shape)
+- Union([shape1, shape2])
+- Difference(mainBody, [tool1, tool2])
+- Intersection([shape1, shape2])
+- FilletEdges(shape, radius, edgeSelector)
+- Edges(shape), Faces(shape)
+
+Rules:
+- Plain JavaScript only inside the code string. No Markdown fences.
+- Output one complete self-contained script. Do not use import, export, await, async, fetch, window, document, self, require, module, or external libraries.
+- Do not use OpenSCAD syntax such as cube(), cylinder(), difference() blocks, module, children(), or $fn.
+- Do not use chain methods like shape.translate() or shape.rotate().
+- Do not call sceneShapes.push(), do not assign to self.sceneShapes, and do not manually manage the scene.
+- Use millimeters.
+- Generate an assembled model: all parts must be positioned, aligned, and joined as a finished assembly, not scattered loose pieces.
+- Prefer robust manufacturable geometry: ribs, fillets/chamfers, mounting holes, bosses, slots, relief cuts, and realistic clearances when supported by the image.
 - The final statement must create or return renderable geometry by calling Box, Sphere, Cylinder, Cone, Union, Difference, or Intersection.
 - Make one final solid or a small set of solids remain renderable in the scene.
 - For booleans, capture shapes in variables and call Difference(main, [cutters]) or Union([parts]).

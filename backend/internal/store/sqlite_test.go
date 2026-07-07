@@ -2,8 +2,12 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestSQLiteProjectCRUD(t *testing.T) {
@@ -91,5 +95,50 @@ func TestSQLiteProjectOwnerIsolation(t *testing.T) {
 	}
 	if _, err := db.GetProjectForOwner(ctx, "bob", alice.ID); err != ErrNotFound {
 		t.Fatalf("expected owner isolation, got %v", err)
+	}
+}
+
+func TestSQLiteMigratesLegacyProjectsWithoutOwnerID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = legacy.Exec(`
+CREATE TABLE projects (
+	id TEXT PRIMARY KEY,
+	title TEXT NOT NULL,
+	prompt TEXT NOT NULL,
+	code TEXT NOT NULL,
+	language TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+INSERT INTO projects (id, title, prompt, code, language, created_at, updated_at)
+VALUES ('legacy-1', 'Legacy Box', 'make box', 'Box(1,1,1,true);', 'cascade-js', ?, ?);
+`, now, now)
+	if closeErr := legacy.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projects, err := db.ListProjects(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("expected migrated legacy project, got %+v", projects)
+	}
+	if projects[0].OwnerID != "default" {
+		t.Fatalf("expected default owner, got %q", projects[0].OwnerID)
 	}
 }

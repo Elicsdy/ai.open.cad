@@ -167,6 +167,42 @@ h2 {
   padding: 16px;
 }
 
+.image-card {
+  display: grid;
+  gap: 12px;
+}
+
+.image-drop {
+  display: grid;
+  gap: 6px;
+  border: 1px dashed rgba(123, 217, 196, 0.36);
+  border-radius: 18px;
+  padding: 14px;
+  background: rgba(123, 217, 196, 0.06);
+  cursor: pointer;
+}
+
+.image-drop:hover {
+  border-color: rgba(242, 183, 93, 0.62);
+  background: rgba(242, 183, 93, 0.08);
+}
+
+.image-drop input {
+  display: none;
+}
+
+.image-drop span {
+  overflow: hidden;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-drop small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .refine-card {
   display: grid;
   gap: 12px;

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,6 +28,7 @@ type Server struct {
 }
 
 const apiPrefix = "/ai/open/cad"
+const maxImageUploadBytes = 10 << 20
 
 func NewServer(store *store.SQLite, llmClient *llm.Client, cfg config.Config) *Server {
 	return &Server{
@@ -56,6 +58,7 @@ func (s *Server) registerAPI(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc(prefix+"/repair-cad", s.requireMethod(http.MethodPost, s.handleRepairCAD))
 	mux.HandleFunc(prefix+"/refine-cad", s.requireMethod(http.MethodPost, s.handleRefineCAD))
 	mux.HandleFunc(prefix+"/generate-cad-async", s.requireMethod(http.MethodPost, s.handleGenerateCADAsync))
+	mux.HandleFunc(prefix+"/generate-cad-from-image-async", s.requireMethod(http.MethodPost, s.handleGenerateCADFromImageAsync))
 	mux.HandleFunc(prefix+"/repair-cad-async", s.requireMethod(http.MethodPost, s.handleRepairCADAsync))
 	mux.HandleFunc(prefix+"/refine-cad-async", s.requireMethod(http.MethodPost, s.handleRefineCADAsync))
 	mux.HandleFunc(prefix+"/jobs/", s.requireMethod(http.MethodGet, s.handleJobByID))
@@ -122,12 +125,95 @@ func (s *Server) handleGenerateCADAsync(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusAccepted, job)
 }
 
+func (s *Server) handleGenerateCADFromImageAsync(w http.ResponseWriter, r *http.Request) {
+	req, ok := parseImageGenerateRequest(w, r)
+	if !ok {
+		return
+	}
+	if req.Language == "" {
+		req.Language = "cascade-js"
+	}
+	req.Language = normalizeLanguage(req.Language)
+	if req.Language != "cascade-js" {
+		writeError(w, http.StatusBadRequest, "only cascade-js generation is supported in v1")
+		return
+	}
+
+	job := s.startAsyncJob(clientID(r), "generate-cad-from-image", func(ctx context.Context) (any, error) {
+		return s.llm.GenerateCADFromImage(ctx, req)
+	})
+	writeJSON(w, http.StatusAccepted, job)
+}
+
 func normalizeLanguage(language string) string {
 	switch strings.ToLower(strings.TrimSpace(language)) {
 	case "", "cascade-js", "cascadejs", "js", "javascript":
 		return "cascade-js"
 	default:
 		return strings.ToLower(strings.TrimSpace(language))
+	}
+}
+
+func parseImageGenerateRequest(w http.ResponseWriter, r *http.Request) (llm.GenerateFromImageRequest, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxImageUploadBytes+(1<<20))
+	if err := r.ParseMultipartForm(maxImageUploadBytes); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid multipart form or image is too large")
+		return llm.GenerateFromImageRequest{}, false
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	file, header, err := r.FormFile("image")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "image file is required")
+		return llm.GenerateFromImageRequest{}, false
+	}
+	defer file.Close()
+
+	image, err := io.ReadAll(io.LimitReader(file, maxImageUploadBytes+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read image")
+		return llm.GenerateFromImageRequest{}, false
+	}
+	if len(image) == 0 {
+		writeError(w, http.StatusBadRequest, "image file is empty")
+		return llm.GenerateFromImageRequest{}, false
+	}
+	if len(image) > maxImageUploadBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "image must be 10MB or smaller")
+		return llm.GenerateFromImageRequest{}, false
+	}
+
+	mimeType := header.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = http.DetectContentType(image[:min(len(image), 512)])
+	}
+	if !isAllowedImageMimeType(mimeType) {
+		detected := http.DetectContentType(image[:min(len(image), 512)])
+		if isAllowedImageMimeType(detected) {
+			mimeType = detected
+		} else {
+			writeError(w, http.StatusBadRequest, "only PNG, JPEG, and WebP images are supported")
+			return llm.GenerateFromImageRequest{}, false
+		}
+	}
+
+	return llm.GenerateFromImageRequest{
+		Prompt:    r.FormValue("prompt"),
+		Language:  r.FormValue("language"),
+		Image:     image,
+		MimeType:  mimeType,
+		FileName:  header.Filename,
+		ProjectID: r.FormValue("projectId"),
+	}, true
+}
+
+func isAllowedImageMimeType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "image/png", "image/jpeg", "image/jpg", "image/webp":
+		return true
+	default:
+		return false
 	}
 }
 

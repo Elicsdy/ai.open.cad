@@ -1,7 +1,9 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -171,6 +173,73 @@ func TestAsyncGenerateCADJob(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("job did not finish")
+}
+
+func TestAsyncGenerateCADFromImageJob(t *testing.T) {
+	server := NewServer(nil, llm.NewClient(config.LLMConfig{}), config.Config{
+		LLM: config.LLMConfig{Timeout: time.Second},
+	})
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("prompt", "make a bracket from this drawing"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("language", "cascade-js"); err != nil {
+		t.Fatal(err)
+	}
+	part, err := writer.CreateFormFile("image", "drawing.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/generate-cad-from-image-async", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp := httptest.NewRecorder()
+	server.Routes().ServeHTTP(resp, req)
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("unexpected async image status: %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	var created asyncJobSnapshot
+	if err := json.Unmarshal(resp.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == "" || created.Kind != "generate-cad-from-image" {
+		t.Fatalf("unexpected job snapshot: %+v", created)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		jobReq := httptest.NewRequest(http.MethodGet, "/jobs/"+created.ID, nil)
+		jobResp := httptest.NewRecorder()
+		server.Routes().ServeHTTP(jobResp, jobReq)
+		if jobResp.Code != http.StatusOK {
+			t.Fatalf("unexpected job status: %d body=%s", jobResp.Code, jobResp.Body.String())
+		}
+
+		var job asyncJobSnapshot
+		if err := json.Unmarshal(jobResp.Body.Bytes(), &job); err != nil {
+			t.Fatal(err)
+		}
+		if job.Status == "done" {
+			if job.Result == nil {
+				t.Fatal("expected image job result")
+			}
+			return
+		}
+		if job.Status == "failed" {
+			t.Fatalf("job failed: %s", job.Error)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("image job did not finish")
 }
 
 func TestAsyncJobStream(t *testing.T) {

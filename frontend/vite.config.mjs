@@ -34,7 +34,7 @@ export default defineConfig({
         target: 'http://localhost:15566',
         changeOrigin: true,
       },
-      [`^${appBase}/(health|generate-cad|repair-cad|refine-cad|generate-cad-async|repair-cad-async|refine-cad-async|jobs|projects)(/.*)?$`]: {
+      [`^${appBase}/(health|generate-cad|repair-cad|refine-cad|generate-cad-async|generate-cad-from-image-async|repair-cad-async|refine-cad-async|jobs|projects)(/.*)?$`]: {
         target: 'http://localhost:15566',
         changeOrigin: true,
       },

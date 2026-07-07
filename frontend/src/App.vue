@@ -16,8 +16,36 @@
           v-model="prompt"
           placeholder="例如：做一个 60x40x20 的盒子，四角圆角，中间挖圆孔"
         />
-        <button class="primary" type="button" :disabled="busy || !engineReady" @click="handleGenerate">
+        <button class="primary" type="button" :disabled="busy || !engineReady || !prompt.trim()" @click="handleGenerate">
           {{ busy ? '生成中...' : '生成 CAD' }}
+        </button>
+      </section>
+
+      <section class="image-card">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">Vision</span>
+            <h2>图片转 CAD</h2>
+          </div>
+          <button class="ghost" type="button" :disabled="!selectedImage" @click="clearSelectedImage">清除</button>
+        </div>
+        <label class="image-drop" for="image-upload">
+          <input
+            id="image-upload"
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            @change="handleImageSelected"
+          />
+          <span>{{ selectedImage ? selectedImage.name : '选择图纸或物品图片' }}</span>
+          <small>图纸优先使用标注尺寸；物品图片会按外形和比例近似建模。</small>
+        </label>
+        <button
+          class="primary"
+          type="button"
+          :disabled="busy || !engineReady || !selectedImage"
+          @click="handleGenerateFromImage"
+        >
+          {{ busy ? '识别中...' : '根据图片生成 CAD' }}
         </button>
       </section>
 
@@ -149,6 +177,7 @@ import {
   createProject,
   deleteProject,
   generateCAD,
+  generateCADFromImage,
   listProjects,
   refineCAD,
   repairCAD,
@@ -169,7 +198,7 @@ const examples = [
   '做一个法兰盘，外径 84mm，中间孔 18mm，四个螺栓孔',
 ]
 
-const prompt = ref(examples[0])
+const prompt = ref('')
 const code = ref(`// Cascade Studio JS mode.
 // Click "Generate CAD" to start, or edit JS and run directly.
 
@@ -193,6 +222,7 @@ const exportLabel = computed(() => (exportExtension.value === 'step' ? '导出 S
 const refineOpen = ref(false)
 const refineInstruction = ref('')
 const modelStreamText = ref('')
+const selectedImage = ref<File | null>(null)
 
 let engine: CascadeEngineAdapter | null = createFallbackCascadeEngine()
 let evaluationRunId = 0
@@ -233,6 +263,25 @@ async function handleGenerate(): Promise<void> {
     explanation.value = response.explanation
     warnings.value = response.warnings ?? []
     await evaluateCodeWithAutoRepair('Generated')
+  })
+}
+
+async function handleGenerateFromImage(): Promise<void> {
+  if (!selectedImage.value) {
+    return
+  }
+  await runBusy(async () => {
+    status.value = '正在识别图片并生成 CAD'
+    logs.value = []
+    modelStreamText.value = ''
+    const response = await generateCADFromImage(selectedImage.value as File, prompt.value, {
+      onEvent: handleJobEvent,
+    })
+    code.value = response.code
+    explanation.value = response.explanation
+    warnings.value = response.warnings ?? []
+    currentProjectId.value = null
+    await evaluateCodeWithAutoRepair('Image-generated')
   })
 }
 
@@ -353,6 +402,19 @@ async function handleSave(): Promise<void> {
 
 function clearRefine(): void {
   refineInstruction.value = ''
+}
+
+function handleImageSelected(event: Event): void {
+  const input = event.target as HTMLInputElement
+  selectedImage.value = input.files?.[0] ?? null
+}
+
+function clearSelectedImage(): void {
+  selectedImage.value = null
+  const input = document.getElementById('image-upload') as HTMLInputElement | null
+  if (input) {
+    input.value = ''
+  }
 }
 
 async function handleSaveLocal(): Promise<void> {
