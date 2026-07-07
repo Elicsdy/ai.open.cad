@@ -1,0 +1,34 @@
+version: 2
+project_name: aiOpenCAD
+dist: goreleaser-dist
+
+before:
+  hooks:
+    - npm --prefix frontend run build
+
+builds:
+  - id: linux-arm64
+    binary: aiOpenCAD
+    dir: ./backend
+    main: ./cmd/server
+    flags:
+      - -buildvcs=false
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - arm64
+    hooks:
+      pre: go run build/pre/pre-build.go -os=linux -arch=arm64 -tag={{.Tag}}
+
+archives:
+  - formats: [zip]
+    name_template: "aiOpenCAD_{{.Os}}_{{.Arch}}_{{.Tag}}"
+    files:
+      - src: build/release.config.json
+        dst: config.json
+      - daemon.json
+      - favicon.ico
+      - dist/**
+      - README.md

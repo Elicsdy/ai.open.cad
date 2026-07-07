@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Backend",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/backend/cmd/server",
+      "cwd": "${workspaceFolder}/backend",
+      "buildFlags": "-buildvcs=false",
+      "env": {
+        "APP_CONFIG_PATH": "${workspaceFolder}/config.json",
+        "FRONTEND_DIST": "../dist",
+        "GOCACHE": "${workspaceFolder}/.cache/go-build",
+        "GOMODCACHE": "${workspaceFolder}/.cache/gomod"
+      }
+    }
+  ]
+}

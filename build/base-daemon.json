@@ -1,0 +1,45 @@
+{
+  "name": "AI OpenCAD",
+  "description": "AI OpenCAD CAD generation service",
+  "icon": "favicon.ico",
+  "pkg": "com.sansi.aiopencad",
+  "interpreter": "",
+  "version": "0.0.1",
+  "path": "./aiOpenCAD",
+  "args": null,
+  "os": "linux",
+  "arch": "amd64",
+  "port": 15566,
+  "port_type": "HTTP",
+  "doc": "",
+  "api_doc": "",
+  "homepage": "{{currentServer}}/ai/open/cad/",
+  "enable_auth": true,
+  "logs": null,
+  "datas": [
+    "{{app}}/config.json",
+    "{{app}}/data/app.db"
+  ],
+  "configs": [
+    {
+      "title": "Backend configuration",
+      "type": "json",
+      "path": "{{app}}/config.json",
+      "schema": ""
+    }
+  ],
+  "firewall_enable": true,
+  "firewall_ports": [
+    "15566"
+  ],
+  "gateway": [
+    {
+       "enable": true,
+      "gatewayType": "HTTP",
+      "apiPath": "http://127.0.0.1:15566",
+      "apiPrefix": "/ai/open/cad",
+      "removePrefix": false,
+      "apiPermission": null
+    }
+  ]
+}

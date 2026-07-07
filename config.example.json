@@ -1,0 +1,13 @@
+{
+  "addr": ":15566",
+  "dbPath": "./data/app.db",
+  "frontendDist": "../dist",
+  "llm": {
+    "baseUrl": "https://api.openai.com",
+    "apiKey": "",
+    "model": "gpt-5.5",
+    "timeout": "120s",
+    "reasoningEffort": "xhigh",
+    "enableWebSearch": true
+  }
+}
