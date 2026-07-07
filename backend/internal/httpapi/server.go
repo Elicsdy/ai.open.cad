@@ -67,15 +67,22 @@ func (s *Server) registerAPI(mux *http.ServeMux, prefix string) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	timeout := s.cfg.LLM.Timeout
+	if timeout <= 0 {
+		timeout = 600 * time.Second
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"demoMode":    s.cfg.LLM.APIKey == "",
-		"agentMode":   false,
-		"llmModel":    s.cfg.LLM.Model,
-		"reasoning":   s.cfg.LLM.ReasoningEffort,
-		"webSearch":   s.cfg.LLM.EnableWebSearch,
-		"serverTime":  time.Now().UTC(),
-		"application": "ai-opencad",
+		"ok":                true,
+		"demoMode":          s.cfg.LLM.APIKey == "",
+		"agentMode":         false,
+		"llmModel":          s.cfg.LLM.Model,
+		"reasoning":         s.cfg.LLM.ReasoningEffort,
+		"webSearch":         s.cfg.LLM.EnableWebSearch,
+		"webSearchTool":     s.cfg.LLM.WebSearchTool,
+		"requireWebSearch":  s.cfg.LLM.RequireWebSearch,
+		"llmTimeoutSeconds": int(timeout / time.Second),
+		"serverTime":        time.Now().UTC(),
+		"application":       "ai-opencad",
 	})
 }
 
@@ -340,7 +347,7 @@ func (s *Server) runAsyncJob(id string, run func(context.Context) (any, error)) 
 
 	timeout := s.cfg.LLM.Timeout
 	if timeout <= 0 {
-		timeout = 120 * time.Second
+		timeout = 600 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

@@ -40,7 +40,7 @@ Create `config.json` in the project root:
     "baseUrl": "https://api.openai.com",
     "apiKey": "your-api-key",
     "model": "gpt-5.5",
-    "timeout": "120s",
+    "timeout": "600s",
     "reasoningEffort": "xhigh",
     "enableWebSearch": true
   }
@@ -52,11 +52,13 @@ LLM fields:
 - `baseUrl`: OpenAI Responses API base URL. It can be a root URL, `/v1`, or the full `/v1/responses` endpoint.
 - `apiKey`: API key sent as `Authorization: Bearer ...`.
 - `model`: model name, default `gpt-5.5`.
-- `timeout`: request timeout, default `120s`.
+- `timeout`: request timeout, default `600s`.
 - `reasoningEffort`: reasoning strength for Responses API, default `xhigh`.
-- `enableWebSearch`: when true, the backend gives the model the `web_search_preview` tool so it can look up real-world dimensions and references before generating CAD.
+- `enableWebSearch`: when true, the backend gives the model a Responses API web search tool so it can look up real-world dimensions and references before generating CAD.
+- `webSearchTool`: web search tool type, default `web_search`; set `web_search_preview` only for legacy compatible gateways.
+- `requireWebSearch`: when true, the backend sends `tool_choice: "required"` and will not silently fall back to a no-search model call.
 
-If a third-party OpenAI-compatible proxy does not support Responses API, reasoning effort, or web search, the backend will automatically retry without web search/reasoning and then fall back to Chat Completions.
+If a third-party OpenAI-compatible proxy does not support required web search, generation fails with a clear error instead of letting the model invent dimensions. Set `requireWebSearch` to `false` only if you prefer best-effort generation without verified search.
 
 Long-running CAD generation, repair, and refinement use async jobs. Job snapshots include `events`, and the frontend shows those events while waiting so users can see model attempts, fallback steps, streamed model deltas, parsing, and completion progress.
 

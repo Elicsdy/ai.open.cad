@@ -6,8 +6,10 @@
     "baseUrl": "https://api.openai.com",
     "apiKey": "",
     "model": "gpt-5.5",
-    "timeout": "120s",
+    "timeout": "600s",
     "reasoningEffort": "xhigh",
-    "enableWebSearch": true
+    "enableWebSearch": true,
+    "webSearchTool": "web_search",
+    "requireWebSearch": true
   }
 }

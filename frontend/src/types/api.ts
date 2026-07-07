@@ -51,6 +51,20 @@ export interface AsyncJobEvent {
   message: string
 }
 
+export interface HealthResponse {
+  ok: boolean
+  demoMode: boolean
+  agentMode: boolean
+  llmModel: string
+  reasoning: string
+  webSearch: boolean
+  webSearchTool: string
+  requireWebSearch: boolean
+  llmTimeoutSeconds: number
+  serverTime: string
+  application: string
+}
+
 export interface Project {
   id: string
   title: string

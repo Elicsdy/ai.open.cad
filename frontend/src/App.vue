@@ -176,11 +176,13 @@ import type * as THREE from 'three'
 import {
   createProject,
   deleteProject,
+  getHealth,
   generateCAD,
   generateCADFromImage,
   listProjects,
   refineCAD,
   repairCAD,
+  setAsyncJobWaitLimitMs,
   updateProject,
 } from '@/api/client'
 import ModelViewer from '@/components/ModelViewer.vue'
@@ -226,11 +228,25 @@ const selectedImage = ref<File | null>(null)
 
 let engine: CascadeEngineAdapter | null = createFallbackCascadeEngine()
 let evaluationRunId = 0
+let streamLogTimer: number | null = null
+let streamLogUpdatedAt = 0
 
 onMounted(async () => {
   window.localStorage.removeItem('ai-opencad-llm-settings')
+  void syncRuntimeSettings()
   await Promise.all([initEngine(), refreshProjects()])
 })
+
+async function syncRuntimeSettings(): Promise<void> {
+  try {
+    const health = await getHealth()
+    if (health.llmTimeoutSeconds > 0) {
+      setAsyncJobWaitLimitMs((health.llmTimeoutSeconds + 120) * 1000)
+    }
+  } catch {
+    setAsyncJobWaitLimitMs(30 * 60_000)
+  }
+}
 
 async function initEngine(): Promise<void> {
   try {
@@ -370,17 +386,48 @@ async function evaluateCodeWithAutoRepair(sourceLabel: string): Promise<void> {
 function handleJobEvent(event: AsyncJobEvent): void {
   if (event.message.startsWith('MODEL_DELTA ')) {
     modelStreamText.value += event.message.slice('MODEL_DELTA '.length)
-    const preview = modelStreamText.value.replace(/\s+/g, ' ').slice(-500)
-    const message = `${formatJobEventTime(event.time)} Model streaming: ${preview}`
-    logs.value = [message, ...logs.value.filter((log) => !log.includes(' Model streaming: '))].slice(0, 80)
-    status.value = 'Model is streaming response'
+    scheduleStreamLogUpdate(event.time)
     return
   }
+  flushStreamLog()
   const message = `${formatJobEventTime(event.time)} ${event.message}`
   if (!logs.value.includes(message)) {
     logs.value = [message, ...logs.value].slice(0, 80)
   }
   status.value = event.message
+}
+
+function scheduleStreamLogUpdate(eventTime: string): void {
+  const now = Date.now()
+  if (now - streamLogUpdatedAt > 200) {
+    updateStreamLog(eventTime)
+    return
+  }
+  if (streamLogTimer !== null) {
+    return
+  }
+  streamLogTimer = window.setTimeout(() => {
+    streamLogTimer = null
+    updateStreamLog(eventTime)
+  }, 200)
+}
+
+function updateStreamLog(eventTime: string): void {
+  streamLogUpdatedAt = Date.now()
+  const preview = modelStreamText.value.replace(/\s+/g, ' ').slice(-500)
+  const message = `${formatJobEventTime(eventTime)} Model streaming: ${preview}`
+  logs.value = [message, ...logs.value.filter((log) => !log.includes(' Model streaming: '))].slice(0, 80)
+  status.value = 'Model is streaming response'
+}
+
+function flushStreamLog(): void {
+  if (streamLogTimer !== null) {
+    window.clearTimeout(streamLogTimer)
+    streamLogTimer = null
+  }
+  if (modelStreamText.value) {
+    updateStreamLog(new Date().toISOString())
+  }
 }
 
 async function handleSave(): Promise<void> {

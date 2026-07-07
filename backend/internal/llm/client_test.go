@@ -84,12 +84,13 @@ func TestGenerateCADCallsOpenAIResponsesAPI(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(config.LLMConfig{
-		BaseURL:         server.URL,
-		APIKey:          "test-key",
-		Model:           "test-model",
-		Timeout:         time.Second,
-		ReasoningEffort: "xhigh",
-		EnableWebSearch: true,
+		BaseURL:          server.URL,
+		APIKey:           "test-key",
+		Model:            "test-model",
+		Timeout:          time.Second,
+		ReasoningEffort:  "xhigh",
+		EnableWebSearch:  true,
+		RequireWebSearch: true,
 	})
 	resp, err := client.GenerateCAD(context.Background(), GenerateRequest{
 		Prompt:   "make a box",
@@ -104,8 +105,11 @@ func TestGenerateCADCallsOpenAIResponsesAPI(t *testing.T) {
 	if seen.Reasoning == nil || seen.Reasoning.Effort != "xhigh" {
 		t.Fatalf("unexpected reasoning config: %+v", seen.Reasoning)
 	}
-	if len(seen.Tools) != 1 || seen.Tools[0].Type != "web_search_preview" {
+	if len(seen.Tools) != 1 || seen.Tools[0].Type != "web_search" {
 		t.Fatalf("unexpected tools: %+v", seen.Tools)
+	}
+	if seen.ToolChoice != "required" {
+		t.Fatalf("expected required tool choice, got %q", seen.ToolChoice)
 	}
 	if seen.Text == nil || seen.Text.Format == nil || seen.Text.Format.Type != "json_schema" {
 		t.Fatalf("unexpected text format: %+v", seen.Text)
@@ -293,12 +297,13 @@ func TestGenerateCADFallsBackToChatCompletions(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(config.LLMConfig{
-		BaseURL:         server.URL,
-		APIKey:          "test-key",
-		Model:           "test-model",
-		Timeout:         time.Second,
-		ReasoningEffort: "xhigh",
-		EnableWebSearch: true,
+		BaseURL:          server.URL,
+		APIKey:           "test-key",
+		Model:            "test-model",
+		Timeout:          time.Second,
+		ReasoningEffort:  "xhigh",
+		EnableWebSearch:  true,
+		RequireWebSearch: false,
 	})
 	resp, err := client.GenerateCAD(context.Background(), GenerateRequest{
 		Prompt:   "make a cube",
@@ -310,11 +315,49 @@ func TestGenerateCADFallsBackToChatCompletions(t *testing.T) {
 	if resp.Code != "Box(8,8,8,true);" {
 		t.Fatalf("unexpected code: %s", resp.Code)
 	}
-	if len(paths) != 4 {
-		t.Fatalf("expected three responses attempts plus chat fallback, got paths: %+v", paths)
+	if len(paths) != 8 {
+		t.Fatalf("expected six responses attempts plus streamed and non-streamed chat fallback, got paths: %+v", paths)
 	}
 	if seenChat.ResponseFormat == nil || seenChat.ResponseFormat.Type != "json_object" {
 		t.Fatalf("expected json_object chat fallback, got %+v", seenChat.ResponseFormat)
+	}
+}
+
+func TestGenerateCADRequiredWebSearchDoesNotFallBackToChat(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"unsupported tool: web_search"}}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(config.LLMConfig{
+		BaseURL:          server.URL,
+		APIKey:           "test-key",
+		Model:            "test-model",
+		Timeout:          time.Second,
+		ReasoningEffort:  "xhigh",
+		EnableWebSearch:  true,
+		RequireWebSearch: true,
+	})
+	_, err := client.GenerateCAD(context.Background(), GenerateRequest{
+		Prompt:   "make a cube with verified dimensions",
+		Language: "cascade-js",
+	})
+	if err == nil {
+		t.Fatal("expected required web search error")
+	}
+	if !strings.Contains(err.Error(), "required web search is not available") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, path := range paths {
+		if path == "/v1/chat/completions" {
+			t.Fatalf("required web search should not fall back to chat completions: %+v", paths)
+		}
 	}
 }
 
@@ -362,5 +405,48 @@ func TestGenerateCADStreamsResponsesDeltas(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(progress, "\n"), "MODEL_DELTA") {
 		t.Fatalf("expected streamed progress delta, got %+v", progress)
+	}
+}
+
+func TestReadResponsesStreamUsesSSEEventNameWhenTypeMissing(t *testing.T) {
+	var progress []string
+	ctx := WithProgress(context.Background(), func(message string) {
+		progress = append(progress, message)
+	})
+
+	content, err := readResponsesStream(ctx, strings.NewReader(strings.Join([]string{
+		"event: response.output_text.delta",
+		`data: {"delta":"hello "}`,
+		"",
+		"event: response.output_text.delta",
+		`data: {"delta":"world"}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "hello world" {
+		t.Fatalf("unexpected stream content: %q", content)
+	}
+	if got := strings.Join(progress, "\n"); !strings.Contains(got, "MODEL_DELTA hello ") || !strings.Contains(got, "MODEL_DELTA world") {
+		t.Fatalf("expected model deltas in progress, got %+v", progress)
+	}
+}
+
+func TestReadResponsesStreamExtractsCompletedResponseOutput(t *testing.T) {
+	content, err := readResponsesStream(context.Background(), strings.NewReader(strings.Join([]string{
+		"event: response.completed",
+		`data: {"response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"code\":\"Box(2,2,2,true);\",\"explanation\":\"ok\",\"warnings\":[]}"}]}]}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(content, `"code":"Box(2,2,2,true);"`) {
+		t.Fatalf("unexpected completed content: %q", content)
 	}
 }

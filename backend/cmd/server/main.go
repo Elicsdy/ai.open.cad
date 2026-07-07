@@ -37,10 +37,15 @@ func main() {
 	}
 
 	log.Printf("AI OpenCAD backend listening on %s", cfg.Addr)
+	if cfg.ConfigPath == "" {
+		log.Printf("config file not found; using defaults and environment variables")
+	} else {
+		log.Printf("loaded config from %s", cfg.ConfigPath)
+	}
 	if cfg.LLM.APIKey == "" {
 		log.Printf("LLM apiKey is empty; using built-in demo CAD responses")
 	} else {
-		log.Printf("using OpenAI Responses API at %s with model %s, reasoning=%s, webSearch=%t", cfg.LLM.BaseURL, cfg.LLM.Model, cfg.LLM.ReasoningEffort, cfg.LLM.EnableWebSearch)
+		log.Printf("using OpenAI Responses API at %s with model %s, reasoning=%s, webSearch=%t, webSearchTool=%s, requireWebSearch=%t", cfg.LLM.BaseURL, cfg.LLM.Model, cfg.LLM.ReasoningEffort, cfg.LLM.EnableWebSearch, cfg.LLM.WebSearchTool, cfg.LLM.RequireWebSearch)
 	}
 
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

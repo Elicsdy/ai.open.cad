@@ -95,12 +95,13 @@ type modelMessage struct {
 }
 
 type responsesRequest struct {
-	Model     string              `json:"model"`
-	Input     []responseInput     `json:"input"`
-	Reasoning *responsesReasoning `json:"reasoning,omitempty"`
-	Tools     []responsesTool     `json:"tools,omitempty"`
-	Text      *responsesText      `json:"text,omitempty"`
-	Stream    bool                `json:"stream,omitempty"`
+	Model      string              `json:"model"`
+	Input      []responseInput     `json:"input"`
+	Reasoning  *responsesReasoning `json:"reasoning,omitempty"`
+	Tools      []responsesTool     `json:"tools,omitempty"`
+	ToolChoice string              `json:"tool_choice,omitempty"`
+	Text       *responsesText      `json:"text,omitempty"`
+	Stream     bool                `json:"stream,omitempty"`
 }
 
 type responseInput struct {
@@ -185,6 +186,8 @@ type llmHTTPError struct {
 	body   string
 }
 
+var errStreamingNoText = errors.New("streaming response did not contain output text")
+
 func (e llmHTTPError) Error() string {
 	return fmt.Sprintf("llm request failed: status=%d body=%s", e.status, e.body)
 }
@@ -192,7 +195,7 @@ func (e llmHTTPError) Error() string {
 func NewClient(cfg config.LLMConfig) *Client {
 	timeout := cfg.Timeout
 	if timeout == 0 {
-		timeout = 120 * time.Second
+		timeout = 600 * time.Second
 	}
 	if cfg.Model == "" {
 		cfg.Model = defaultModel
@@ -392,6 +395,9 @@ func (c *Client) effectiveConfig() config.LLMConfig {
 	if cfg.Model == "" {
 		cfg.Model = defaultModel
 	}
+	if cfg.EnableWebSearch && strings.TrimSpace(cfg.WebSearchTool) == "" {
+		cfg.WebSearchTool = "web_search"
+	}
 	return cfg
 }
 
@@ -399,6 +405,9 @@ func (c *Client) callModel(ctx context.Context, cfg config.LLMConfig, schemaName
 	content, responsesErr := c.callResponsesInput(ctx, cfg, schemaName, schema, responseInputMessages(messages))
 	if responsesErr == nil {
 		return content, nil
+	}
+	if cfg.EnableWebSearch && cfg.RequireWebSearch {
+		return "", fmt.Errorf("required web search is not available through Responses API: %w", responsesErr)
 	}
 
 	reportProgress(ctx, "Trying Chat Completions compatibility fallback.")
@@ -435,7 +444,7 @@ func (c *Client) doResponses(ctx context.Context, cfg config.LLMConfig, schemaNa
 	if err == nil {
 		return content, nil
 	}
-	if !isStreamingUnsupported(err) {
+	if !isStreamingUnsupported(err) && !errors.Is(err, errStreamingNoText) {
 		return "", err
 	}
 	reportProgress(ctx, "Provider does not support Responses streaming; retrying without stream.")
@@ -461,7 +470,10 @@ func (c *Client) doResponsesRequest(ctx context.Context, cfg config.LLMConfig, s
 		reqBody.Reasoning = &responsesReasoning{Effort: cfg.ReasoningEffort}
 	}
 	if cfg.EnableWebSearch {
-		reqBody.Tools = []responsesTool{{Type: "web_search_preview"}}
+		reqBody.Tools = []responsesTool{{Type: normalizedWebSearchTool(cfg.WebSearchTool)}}
+		if cfg.RequireWebSearch {
+			reqBody.ToolChoice = "required"
+		}
 	}
 	raw, err := json.Marshal(reqBody)
 	if err != nil {
@@ -488,7 +500,7 @@ func (c *Client) doResponsesRequest(ctx context.Context, cfg config.LLMConfig, s
 		}
 		return "", llmHTTPError{status: resp.StatusCode, body: string(body)}
 	}
-	if stream && isEventStream(resp.Header.Get("Content-Type")) {
+	if stream {
 		return readResponsesStream(ctx, resp.Body)
 	}
 
@@ -592,14 +604,34 @@ type responseFallbackAttempt struct {
 func responseFallbackAttempts(cfg config.LLMConfig) []responseFallbackAttempt {
 	attempts := []responseFallbackAttempt{{label: "responses_configured", cfg: cfg}}
 	if cfg.EnableWebSearch {
-		withoutSearch := cfg
-		withoutSearch.EnableWebSearch = false
-		attempts = append(attempts, responseFallbackAttempt{label: "responses_without_web_search", cfg: withoutSearch})
+		alternateTool := alternateWebSearchTool(cfg.WebSearchTool)
+		if alternateTool != "" {
+			withAlternateSearchTool := cfg
+			withAlternateSearchTool.WebSearchTool = alternateTool
+			attempts = append(attempts, responseFallbackAttempt{label: "responses_" + alternateTool, cfg: withAlternateSearchTool})
+		}
 
 		if cfg.ReasoningEffort != "" && cfg.ReasoningEffort != "none" {
-			withoutSearchOrReasoning := withoutSearch
-			withoutSearchOrReasoning.ReasoningEffort = "none"
-			attempts = append(attempts, responseFallbackAttempt{label: "responses_without_web_search_or_reasoning", cfg: withoutSearchOrReasoning})
+			withoutReasoning := cfg
+			withoutReasoning.ReasoningEffort = "none"
+			attempts = append(attempts, responseFallbackAttempt{label: "responses_with_web_search_without_reasoning", cfg: withoutReasoning})
+			if alternateTool != "" {
+				withoutReasoningAlternateTool := withoutReasoning
+				withoutReasoningAlternateTool.WebSearchTool = alternateTool
+				attempts = append(attempts, responseFallbackAttempt{label: "responses_" + alternateTool + "_without_reasoning", cfg: withoutReasoningAlternateTool})
+			}
+		}
+
+		if !cfg.RequireWebSearch {
+			withoutSearch := cfg
+			withoutSearch.EnableWebSearch = false
+			attempts = append(attempts, responseFallbackAttempt{label: "responses_without_web_search", cfg: withoutSearch})
+
+			if cfg.ReasoningEffort != "" && cfg.ReasoningEffort != "none" {
+				withoutSearchOrReasoning := withoutSearch
+				withoutSearchOrReasoning.ReasoningEffort = "none"
+				attempts = append(attempts, responseFallbackAttempt{label: "responses_without_web_search_or_reasoning", cfg: withoutSearchOrReasoning})
+			}
 		}
 	} else if cfg.ReasoningEffort != "" && cfg.ReasoningEffort != "none" {
 		withoutReasoning := cfg
@@ -615,14 +647,38 @@ func describeResponseAttempt(cfg config.LLMConfig) string {
 		features = append(features, "reasoning="+cfg.ReasoningEffort)
 	}
 	if cfg.EnableWebSearch {
-		features = append(features, "web_search")
+		features = append(features, "web_search="+normalizedWebSearchTool(cfg.WebSearchTool))
+		if cfg.RequireWebSearch {
+			features = append(features, "web_search_required")
+		}
 	}
 	return strings.Join(features, ", ")
 }
 
+func normalizedWebSearchTool(tool string) string {
+	tool = strings.ToLower(strings.TrimSpace(tool))
+	switch tool {
+	case "web_search", "web_search_preview":
+		return tool
+	default:
+		return "web_search"
+	}
+}
+
+func alternateWebSearchTool(tool string) string {
+	switch normalizedWebSearchTool(tool) {
+	case "web_search":
+		return "web_search_preview"
+	case "web_search_preview":
+		return "web_search"
+	default:
+		return ""
+	}
+}
+
 func (c *Client) callChatCompletions(ctx context.Context, cfg config.LLMConfig, messages []modelMessage) (string, error) {
 	content, err := c.doChatCompletions(ctx, cfg, messages, true, true)
-	if err != nil && isStreamingUnsupported(err) {
+	if err != nil && (isStreamingUnsupported(err) || errors.Is(err, errStreamingNoText)) {
 		reportProgress(ctx, "Provider does not support Chat Completions streaming; retrying without stream.")
 		content, err = c.doChatCompletions(ctx, cfg, messages, true, false)
 	}
@@ -667,7 +723,7 @@ func (c *Client) doChatCompletions(ctx context.Context, cfg config.LLMConfig, me
 		}
 		return "", llmHTTPError{status: resp.StatusCode, body: string(body)}
 	}
-	if stream && isEventStream(resp.Header.Get("Content-Type")) {
+	if stream {
 		return readChatCompletionsStream(ctx, resp.Body)
 	}
 
@@ -714,31 +770,24 @@ func chatCompletionsEndpoint(baseURL string) string {
 func readResponsesStream(ctx context.Context, reader io.Reader) (string, error) {
 	reportProgress(ctx, "Receiving streamed model response.")
 	var out strings.Builder
-	err := readSSEData(reader, func(data string) error {
+	err := readSSEData(reader, func(eventName string, data string) error {
 		if data == "[DONE]" {
 			return nil
 		}
-		var event struct {
-			Type  string `json:"type"`
-			Delta string `json:"delta,omitempty"`
-			Text  string `json:"text,omitempty"`
-			Error *struct {
-				Message string `json:"message"`
-			} `json:"error,omitempty"`
-		}
+		var event responsesStreamEvent
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			return nil
 		}
 		if event.Error != nil && event.Error.Message != "" {
 			return errors.New(event.Error.Message)
 		}
-		switch event.Type {
-		case "response.output_text.delta":
-			appendStreamDelta(ctx, &out, event.Delta)
-		case "response.output_text.done":
-			if out.Len() == 0 {
-				appendStreamDelta(ctx, &out, event.Text)
-			}
+		eventType := firstNonEmpty(event.Type, eventName)
+		if delta := extractResponsesStreamDelta(eventType, event); delta != "" {
+			appendStreamDelta(ctx, &out, delta)
+			return nil
+		}
+		if out.Len() == 0 {
+			appendStreamDelta(ctx, &out, extractResponsesStreamFinalText(event))
 		}
 		return nil
 	})
@@ -747,15 +796,125 @@ func readResponsesStream(ctx context.Context, reader io.Reader) (string, error) 
 	}
 	content := strings.TrimSpace(out.String())
 	if content == "" {
-		return "", errors.New("streaming response did not contain output text")
+		return "", errStreamingNoText
 	}
 	return content, nil
+}
+
+type responsesStreamEvent struct {
+	Type       string             `json:"type"`
+	Delta      string             `json:"delta,omitempty"`
+	Text       string             `json:"text,omitempty"`
+	OutputText string             `json:"output_text,omitempty"`
+	Response   responsesResponse  `json:"response,omitempty"`
+	Item       responsesItem      `json:"item,omitempty"`
+	Output     []responsesItem    `json:"output,omitempty"`
+	Content    []responsesPart    `json:"content,omitempty"`
+	Choices    []chatStreamChoice `json:"choices,omitempty"`
+	Error      *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+type responsesItem struct {
+	Type    string          `json:"type"`
+	Role    string          `json:"role,omitempty"`
+	Content []responsesPart `json:"content,omitempty"`
+}
+
+type responsesPart struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+}
+
+type chatStreamChoice struct {
+	Delta struct {
+		Content string `json:"content,omitempty"`
+	} `json:"delta"`
+	Message struct {
+		Content string `json:"content,omitempty"`
+	} `json:"message"`
+}
+
+func extractResponsesStreamDelta(eventType string, event responsesStreamEvent) string {
+	switch eventType {
+	case "response.output_text.delta", "output_text.delta":
+		return event.Delta
+	}
+	if event.Delta != "" && strings.Contains(eventType, "delta") {
+		return event.Delta
+	}
+	for _, choice := range event.Choices {
+		if choice.Delta.Content != "" {
+			return choice.Delta.Content
+		}
+	}
+	return ""
+}
+
+func extractResponsesStreamFinalText(event responsesStreamEvent) string {
+	if event.Text != "" {
+		return event.Text
+	}
+	if event.OutputText != "" {
+		return event.OutputText
+	}
+	if text := extractResponsesText(event.Response); text != "" {
+		return text
+	}
+	if text := extractResponsesItemsText(event.Output); text != "" {
+		return text
+	}
+	if text := extractResponsesItemsText([]responsesItem{event.Item}); text != "" {
+		return text
+	}
+	if text := extractResponsesPartsText(event.Content); text != "" {
+		return text
+	}
+	for _, choice := range event.Choices {
+		if choice.Message.Content != "" {
+			return choice.Message.Content
+		}
+	}
+	return ""
+}
+
+func extractResponsesItemsText(items []responsesItem) string {
+	var parts []string
+	for _, item := range items {
+		for _, content := range item.Content {
+			if content.Text != "" {
+				parts = append(parts, content.Text)
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func extractResponsesPartsText(contents []responsesPart) string {
+	var parts []string
+	for _, content := range contents {
+		if content.Text != "" {
+			parts = append(parts, content.Text)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func readChatCompletionsStream(ctx context.Context, reader io.Reader) (string, error) {
 	reportProgress(ctx, "Receiving streamed Chat Completions response.")
 	var out strings.Builder
-	err := readSSEData(reader, func(data string) error {
+	err := readSSEData(reader, func(_ string, data string) error {
 		if data == "[DONE]" {
 			return nil
 		}
@@ -792,22 +951,25 @@ func readChatCompletionsStream(ctx context.Context, reader io.Reader) (string, e
 	}
 	content := strings.TrimSpace(out.String())
 	if content == "" {
-		return "", errors.New("streaming chat response did not contain content")
+		return "", errStreamingNoText
 	}
 	return content, nil
 }
 
-func readSSEData(reader io.Reader, handle func(string) error) error {
+func readSSEData(reader io.Reader, handle func(string, string) error) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	var dataLines []string
+	eventName := ""
 	flush := func() error {
 		if len(dataLines) == 0 {
 			return nil
 		}
 		data := strings.Join(dataLines, "\n")
 		dataLines = dataLines[:0]
-		return handle(strings.TrimSpace(data))
+		currentEvent := eventName
+		eventName = ""
+		return handle(strings.TrimSpace(currentEvent), strings.TrimSpace(data))
 	}
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -818,6 +980,10 @@ func readSSEData(reader io.Reader, handle func(string) error) error {
 			continue
 		}
 		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 			continue
 		}
 		if strings.HasPrefix(line, "data:") {

@@ -80,6 +80,15 @@ func TestAPIRoutesAcceptStrippedGatewayPrefix(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("unexpected stripped health status: %d", resp.Code)
 	}
+	var health struct {
+		LLMTimeoutSeconds int `json:"llmTimeoutSeconds"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &health); err != nil {
+		t.Fatal(err)
+	}
+	if health.LLMTimeoutSeconds != 600 {
+		t.Fatalf("unexpected health timeout: %d", health.LLMTimeoutSeconds)
+	}
 
 	duplicatedReq := httptest.NewRequest(http.MethodGet, apiPrefix+apiPrefix+"/health", nil)
 	duplicatedResp := httptest.NewRecorder()

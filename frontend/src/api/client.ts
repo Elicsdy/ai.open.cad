@@ -3,6 +3,7 @@ import type {
   AsyncJobEvent,
   GenerateCADRequest,
   GenerateCADResponse,
+  HealthResponse,
   Project,
   ProjectInput,
   RefineCADRequest,
@@ -16,8 +17,26 @@ export interface AsyncRequestOptions {
   onEvent?: (event: AsyncJobEvent) => void
 }
 
+const defaultAsyncJobWaitLimitMs = 30 * 60_000
+let asyncJobWaitLimitMs = defaultAsyncJobWaitLimitMs
+
 async function requestJSON<T>(endpoint: string, init?: RequestInit): Promise<T> {
   return request<T>(endpoint, init, { json: true })
+}
+
+export function setAsyncJobWaitLimitMs(ms: number): void {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return
+  }
+  asyncJobWaitLimitMs = Math.max(60_000, Math.floor(ms))
+}
+
+export function getAsyncJobWaitLimitMs(): number {
+  return asyncJobWaitLimitMs
+}
+
+export function getHealth(): Promise<HealthResponse> {
+  return requestJSON('health')
 }
 
 async function requestMultipart<T>(endpoint: string, formData: FormData): Promise<T> {
@@ -103,16 +122,28 @@ export function refineCAD(
   )
 }
 
-export function generateCADFromImage(
+export async function generateCADFromImage(
   file: File,
   prompt: string,
   options?: AsyncRequestOptions,
 ): Promise<GenerateCADResponse> {
+  const uploadFile = await prepareImageForUpload(file, options)
   const form = new FormData()
-  form.append('image', file)
+  form.append('image', uploadFile)
   form.append('prompt', prompt)
   form.append('language', 'cascade-js')
   return requestAsyncJob<GenerateCADResponse>('generate-cad-from-image-async', undefined, options, form)
+}
+
+async function prepareImageForUpload(file: File, options?: AsyncRequestOptions): Promise<File> {
+  try {
+    const uploadFile = await compressImageForUpload(file)
+    reportClientEvent(options, imageUploadMessage(file, uploadFile))
+    return uploadFile
+  } catch (error) {
+    reportClientEvent(options, `Image compression skipped: ${toMessage(error)}`)
+    return file
+  }
 }
 
 export function listProjects(): Promise<Project[]> {
@@ -161,9 +192,9 @@ async function pollJob<T>(
   seenEvents: Set<string>,
   options?: AsyncRequestOptions,
 ): Promise<T> {
-  const deadline = Date.now() + 180_000
+  const deadline = Date.now() + asyncJobWaitLimitMs
   while (Date.now() < deadline) {
-    await sleep(1000)
+    await sleep(500)
     const job = await requestJSON<AsyncJob<T>>(`jobs/${jobId}`)
     emitNewEvents(job.events, seenEvents, options)
     if (job.status === 'done') {
@@ -176,7 +207,8 @@ async function pollJob<T>(
       throw new Error(job.error || 'Background job failed.')
     }
   }
-  throw new Error('Background job is still running after the frontend wait limit. Try again later or increase llm.timeout.')
+  const minutes = Math.max(1, Math.ceil(asyncJobWaitLimitMs / 60000))
+  throw new Error(`Background job is still running after the ${minutes} minute frontend wait limit. Try again later or increase llm.timeout.`)
 }
 
 function emitNewEvents(
@@ -197,6 +229,96 @@ function emitNewEvents(
   }
 }
 
+function reportClientEvent(options: AsyncRequestOptions | undefined, message: string): void {
+  if (!options?.onEvent || !message) {
+    return
+  }
+  options.onEvent({
+    time: new Date().toISOString(),
+    message,
+  })
+}
+
+async function compressImageForUpload(file: File): Promise<File> {
+  if (!file.type.startsWith('image/') || typeof document === 'undefined') {
+    return file
+  }
+
+  const image = await loadImageElement(file)
+  try {
+    const maxDimension = 1600
+    const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight))
+    const width = Math.max(1, Math.round(image.naturalWidth * scale))
+    const height = Math.max(1, Math.round(image.naturalHeight * scale))
+
+    const canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+    const context = canvas.getContext('2d')
+    if (!context) {
+      return file
+    }
+    context.fillStyle = '#ffffff'
+    context.fillRect(0, 0, width, height)
+    context.drawImage(image, 0, 0, width, height)
+
+    const blob = await canvasToBlob(canvas, 'image/jpeg', 0.82)
+    if (!blob || blob.size >= file.size) {
+      return file
+    }
+    return new File([blob], jpegFileName(file.name), {
+      type: 'image/jpeg',
+      lastModified: file.lastModified,
+    })
+  } finally {
+    image.remove()
+  }
+}
+
+function loadImageElement(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const image = new Image()
+    image.onload = () => {
+      URL.revokeObjectURL(url)
+      resolve(image)
+    }
+    image.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('Failed to load image for compression.'))
+    }
+    image.src = url
+  })
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number): Promise<Blob | null> {
+  return new Promise((resolve) => {
+    canvas.toBlob(resolve, type, quality)
+  })
+}
+
+function jpegFileName(name: string): string {
+  const base = name.replace(/\.[^.]+$/, '')
+  return `${base || 'image'}.jpg`
+}
+
+function imageUploadMessage(original: File, upload: File): string {
+  if (upload === original) {
+    return `Image upload size: ${formatBytes(original.size)}.`
+  }
+  return `Image compressed: ${formatBytes(original.size)} -> ${formatBytes(upload.size)}.`
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`
+  }
+  if (bytes < 1024 * 1024) {
+    return `${Math.round(bytes / 102.4) / 10} KB`
+  }
+  return `${Math.round(bytes / 1024 / 102.4) / 10} MB`
+}
+
 function openJobEventStream(
   jobId: string,
   seenEvents: Set<string>,
@@ -207,18 +329,35 @@ function openJobEventStream(
   }
 
   const source = new EventSource(withClientId(apiPath(`jobs/${jobId}/stream`)))
+  let streamClosed = false
+  source.onopen = () => {
+    reportClientEvent(options, 'Live job stream connected.')
+  }
   source.addEventListener('event', (message) => {
     const event = parseSSEData<AsyncJobEvent>(message)
     if (event) {
       emitNewEvents([event], seenEvents, options)
     }
   })
-  source.addEventListener('done', () => source.close())
-  source.addEventListener('failed', () => source.close())
+  source.addEventListener('done', () => {
+    streamClosed = true
+    source.close()
+  })
+  source.addEventListener('failed', () => {
+    streamClosed = true
+    source.close()
+  })
   source.onerror = () => {
+    if (!streamClosed) {
+      reportClientEvent(options, 'Live job stream disconnected; polling continues.')
+    }
+    streamClosed = true
     source.close()
   }
-  return () => source.close()
+  return () => {
+    streamClosed = true
+    source.close()
+  }
 }
 
 function parseSSEData<T>(message: MessageEvent): T | null {
