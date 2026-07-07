@@ -1,5 +1,6 @@
 .env
 .git-repo/
+.git-empty-backup-*/
 config.json
 .cache/
 dist/
